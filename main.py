@@ -1,204 +1,196 @@
 import os
-import openai
-import sounddevice as sd
-import tempfile
-import numpy as np
-from scipy.io import wavfile
-from scipy.spatial.distance import cosine
+import glob
 import json
+import numpy as np
+import faiss
+import ast
+import re
+import openai
+from scipy.spatial.distance import cosine
+from sentence_transformers import SentenceTransformer
 
-# Prompt the user for the OpenAI API key
-api_key = input("Enter your OpenAI API key: ")
-openai.api_key = api_key
-embeddings_folder="./embeddings"
-# Prompt the user for their name or nickname
-name = input('Enter Your Name or Nickname: ')
+# Initialize the model
+model = SentenceTransformer('all-MiniLM-L6-v2')
 
-def get_embedding(text, model="text-embedding-ada-002"):
-    response = openai.Embedding.create(input=text, model=model)
-    embedding = np.squeeze(response['data'][0]['embedding'])
-    return embedding
+# Define the directory to parse
+directory = './docs2vectorize'
 
-def search(query, embedding_dict):
-    query_embedding = get_embedding(query, model="text-embedding-ada-002")
-    query_embedding = np.squeeze(query_embedding)
-    results = []
+# Define the file types to process
+file_types = ['*.py', '*.ts', '*.js', '*.md', "*.txt"]
 
-    for name, item in embedding_dict.items():
-        transcript_embedding = np.squeeze(item["embedding"])
-        similarity = 1 - cosine(query_embedding, transcript_embedding)
-        results.append((name, similarity))
+# Initialize a list to store all chunks
+chunks = []
+processed_files = set()
 
-    results.sort(key=lambda x: x[1], reverse=True)
-    return results
+def process_file(filename):
+    try:
+        with open(filename, 'r', encoding='utf-8') as file:
+            content = file.read()
+    except Exception as e:
+        print(f"Failed to read file {filename}: {e}")
+        return []
+
+    try:
+        if filename.endswith('.py'):
+            chunks = split_python_file(content)
+        elif filename.endswith('.ts') or filename.endswith('.js'):
+            chunks = split_typescript_or_javascript_file(content)
+        elif filename.endswith('.md'):
+            chunks = re.split(r'\n#+ ', content)
+        elif filename.endswith('.txt'):
+            chunks = re.split(r'\n\s*\n', content)
+        else:
+            chunks = content.split('\n')
+    except Exception as e:
+        print(f"Failed to split file {filename}: {e}")
+        return []
+
+    return chunks
+
+def split_typescript_or_javascript_file(content):
+    lines = content.split('\n')
+    chunks = ['\n'.join(lines[i:i+10]) for i in range(0, len(lines), 5)]
+    return chunks
+
+def split_python_file(content):
+    # Parse the Python code into an AST
+    module = ast.parse(content)
+
+    # Initialize a list to store the chunks
+    chunks = []
+
+    # Iterate over the top-level statements in the module
+    for statement in module.body:
+        # If the statement is a function or class definition, add it to the chunks
+        if isinstance(statement, (ast.FunctionDef, ast.ClassDef)):
+            # Get the source lines of the statement
+            lines = content.splitlines()[statement.lineno - 1:statement.end_lineno]
+
+            # Join the lines back together and add to the chunks
+            chunks.append('\n'.join(lines))
+
+    return chunks
+
+def generate_embeddings_and_index():
+    # Load processed files from a file
+    global processed_files
+    if os.path.exists('processed_files.txt'):
+        with open('processed_files.txt', 'r') as f:
+            processed_files = set(line.strip() for line in f)
+
+    # Parse over the directory tree
+    for file_type in file_types:
+        for filename in glob.glob(os.path.join(directory, '**', file_type), recursive=True):
+            if filename in processed_files:
+                continue
+
+            chunks.extend(process_file(filename))
+
+            processed_files.add(filename)
+
+    # Save the processed files to a file
+    with open('processed_files.txt', 'w') as f:
+        for filename in processed_files:
+            f.write(filename + '\n')
+
+    # Check if chunks is empty
+    if not chunks:
+        print("No new files to process.")
+        return
+
+    # Generate embeddings for each chunk
+    try:
+        embeddings = model.encode(chunks)
+    except Exception as e:
+        print(f"Failed to generate embeddings: {e}")
+        embeddings = []
+
+    # Combine chunks and embeddings into a list of dictionaries
+    data = [{'chunk': chunk, 'embedding': embedding.tolist()} for chunk, embedding in zip(chunks, embeddings)]
+
+    # Convert embeddings to a numpy array
+    embeddings_np = np.array([item['embedding'] for item in data])
+    # Build a FAISS index for nearest neighbor search
+    print(embeddings)
+    print(embeddings_np.shape)
+    index = faiss.IndexFlatL2(embeddings_np.shape[1])
+
+    index.add(embeddings_np)
+
+    # Define the output directory
+    output_directory = './embeddings/new'
+
+    # Ensure the output directory exists
+    os.makedirs(output_directory, exist_ok=True)
+
+    # Save to JSON file
+    with open(os.path.join(output_directory, 'embeddings.json'), 'w') as f:
+        json.dump(data, f)
+
+    # Save the FAISS index
+    faiss.write_index(index, os.path.join(output_directory, 'index.faiss'))
 
 
-# Set the desired audio parameters
-sample_rate = 16000  # Sample rate in Hz
-duration = 10  # Recording duration in seconds
-
-# Store the embeddings in a local file (JSON format)
-# Load the embeddings from the file (if it exists and is not empty)
-embedding_file = "embeddings.json"
-embedding_dict = {}  # Define the embedding dictionary
-
-# Check if the embeddings file exists
-if os.path.isfile(embedding_file):
-    # Load the embeddings from the file
+def load_embeddings_and_index(embedding_file):
     with open(embedding_file, "r") as file:
-        try:
-            embedding_dict_json = json.load(file)
-            if embedding_dict_json:  # Check if the file is not empty
-                # Convert the embeddings from lists to NumPy arrays
-                embedding_dict = {key: np.array(embedding) for key, embedding in embedding_dict_json.items()}
-            else:
-                print("Embeddings file is empty.")
-        except json.JSONDecodeError:
-            # Invalid JSON format, handle the error
-            print("Invalid JSON format in embeddings file.")
-else:
-    # File does not exist, create a new embeddings dictionary
-    print("Embeddings file not found. Creating a new embeddings dictionary.")
+        data = json.load(file)
+    embeddings = [item['embedding'] for item in data]
+    chunks = [item['chunk'] for item in data]
+    embeddings_np = np.array(embeddings)
+    index = faiss.IndexFlatL2(embeddings_np.shape[1])
+    index.add(embeddings_np)
+    return embeddings_np, index, chunks
 
-# Save the initial embeddings dictionary to the JSON file
-with open(embedding_file, "w") as file:
-    # Convert the embeddings from lists to NumPy arrays before saving
-    embedding_dict_json = {key: embedding.tolist() for key, embedding in embedding_dict.items()}
-    json.dump(embedding_dict_json, file)
+def vector_search(query, index, embeddings, chunks):
+    # Generate an embedding for the query
+    query_embedding = model.encode(query)
 
-# Start the chat loop
+    # Perform a nearest neighbor search
+    D, I = index.search(np.array([query_embedding]), 1)
 
-# Start the chat loop
-while True:
-    # Record audio from the microphone or accept text query
-    query_option = input("Enter '1' to provide a voice query, '2' to provide a text query: ")
-    if query_option == '1':
-        # Record audio from the microphone
-        print("Recording audio. Speak into the microphone...")
-        audio = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1)
-        sd.wait()
+    # I[0][0] gives the index of the nearest neighbor
+    nearest_neighbor = chunks[I[0][0]]
+    print(nearest_neighbor)
+    return nearest_neighbor
 
-        # Save the recorded audio to a temporary file
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
-            temp_audio.name  # Path to the temporary audio file
-            wavfile.write(temp_audio.name, sample_rate, audio)
+def complete_code(text, top_result):
+    try:
+        prompt = f"if the request involves smart contracts, bitcoin, nft, tokens, or anything similar, using scrypt-ts, scrypt,and bitcoin sv library, provide the complete working code for the following request:\n{text}\n\nConsider the following related item: {top_result}"
+        response = openai.Completion.create(
+            engine="text-davinci-003",
+            prompt=prompt,
+            temperature=0,
+            max_tokens=4096-len(prompt),
+            top_p=1.0,
+            frequency_penalty=0.0,
+            presence_penalty=0.0,
+            stop=["###"]
+        )
+        return response.choices[0].text.strip()
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        return None
 
-        # Transcribe the audio using OpenAI API
-        with open(temp_audio.name, "rb") as audio_file:
-            response = openai.Audio.transcribe(
-                model="whisper-1",
-                file=audio_file
-            )
 
-            # Get the transcript from the response
-            transcript = response['text']
-            print("Transcript:")
-            print(transcript)
-    elif query_option == '2':
-        transcript = input("Enter your text query: ")
-    else:
-        print("Invalid option. Please try again.")
-        continue
+def main_file_parser():
+    generate_embeddings_and_index()
 
-    # Embed the query and store it locally
-    embedding = get_embedding(transcript)
-    embedding_dict[name] = {
-        "transcript": transcript,
-        "embedding": embedding.tolist()  # Convert NumPy array to list
-    }
+def main_code_complete():
+    api_key = input("Enter your OpenAI API key: ")
+    openai.api_key = api_key
 
-    # Save the updated embeddings to the JSON file
-    with open("./embeddings.json", "w") as file:
-        # Convert the embeddings from lists to NumPy arrays before saving
-        embedding_dict_json = {key: np.array(embedding).tolist() for key, embedding in embedding_dict.items()}
-        json.dump(embedding_dict_json, file)
+    query = input('What is your code question?')
 
-    # Perform search with the query and relevant documents
-    search_results = search(transcript, embedding_dict)
-    print("Search Results:")
-    for name, similarity in search_results:
-        print(f"{name}: {similarity}")
+    # Load embeddings and perform vector search
+    embeddings, index, chunks = load_embeddings_and_index("./embeddings/new/embeddings.json")
+    top_result = vector_search(query, index, embeddings, chunks)
 
-    # Concatenate relevant documents and conversation history into messages
-    messages = [
-        {"role": "system", "content": "You are ChatGPT, a large language model trained by OpenAI."},
-        {"role": "user", "content": f"What documents should I consider for this query? {transcript}"}
-    ]
+    # Call the complete_code function with the top search result
+    response = complete_code(query, top_result)
+    print(response)
 
-    # Load any additional relevant documents from the "embeddings" folder
-    if os.path.isdir(embeddings_folder):
-        for filename in os.listdir(embeddings_folder):
-            if filename.endswith(".json"):
-                with open(os.path.join(embeddings_folder, filename), "r") as file:
-                    additional_embeddings = json.load(file)
-                    embedding_dict.update(additional_embeddings)
+    # ... same as before ...
 
-    # Submit the query with the concatenated messages
-    response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=messages,
-        temperature=0.8,
-        max_tokens=50
-    )
-
-    # Retrieve the assistant's response
-    assistant_response = response['choices'][0]['message']['content']
-
-    # Print and store the assistant's response
-    print("Assistant's Response:")
-    print(assistant_response)
-
-    # Perform search with the assistant's response and relevant documents
-    search_results = search(assistant_response, embedding_dict)
-    print("Search Results:")
-    for name, similarity in search_results:
-        print(f"{name}: {similarity}")
-
-    # Ask GPT to summarize the conversation
-    summary_prompt = "Summarize this conversation between helpful AI bot and user:"
-    messages.append({"role": "assistant", "content": assistant_response})
-    messages_summary = messages.copy()
-    messages_summary.append({"role": "system", "content": summary_prompt})
-
-    response_summary = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=messages_summary,
-        temperature=0.8,
-        max_tokens=50
-    )
-
-    conversation_summary = response_summary['choices'][0]['message']['content']
-    print("Conversation Summary:")
-    print(conversation_summary)
-
-    # Ask GPT for a response using the conversation summary and user's question
-    response_prompt = f"{conversation_summary}\n\nUser: {transcript}"
-    messages.append({"role": "system", "content": response_prompt})
-
-    response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=messages,
-        temperature=0.8,
-        max_tokens=50
-    )
-
-    # Retrieve the assistant's response
-    assistant_response = response['choices'][0]['message']['content']
-
-    # Print and store the assistant's response
-    print("Assistant's Response:")
-    print(assistant_response)
-
-    # Perform search with the assistant's response and relevant documents
-    search_results = search(assistant_response, embedding_dict)
-    print("Search Results:")
-    for name, similarity in search_results:
-        print(f"{name}: {similarity}")
-
-    # Allow the user to ask more questions
-    more_questions = input("Do you want to ask more questions? (y/n): ").lower() == 'y'
-
-    if more_questions:
-        continue
-    else:
-        break
+if __name__ == "__main__":
+    main_file_parser()
+    main_code_complete()
