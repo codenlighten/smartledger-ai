@@ -1,4 +1,3 @@
-import os
 import openai
 import logging
 from main import load_embeddings_and_index, vector_search
@@ -14,137 +13,111 @@ state = {
     "task_list": [],
 }
 
-
-def getAIResponse(text, context):
-    try:
-        # Load embeddings and perform vector search
-        embeddings, index, chunks = load_embeddings_and_index("./embeddings/new/embeddings.json")
-        top_result = vector_search(text, index, embeddings, chunks)
-        top_result = summarize(top_result)
-        # Use the top result as additional context for the GPT-3 completion
-        prompt = f"Consider the following context:\n{context}\n and the following request\n {text}\n\nConsider the following related item: {top_result}"
-        response = openai.Completion.create(
-            engine="text-davinci-003",
-            prompt=prompt,
-            temperature=0,
-            max_tokens=2000,
-            top_p=1.0,
-            frequency_penalty=0.0,
-            presence_penalty=0.0,
-            stop=["###"]
-        )
-        logging.info('AI Agent:')
-        logging.info(response.choices[0].text.strip())
-        return response.choices[0].text.strip()
-    except openai.Error as e:
-        logging.error(f"OpenAI error: {e}")
-        return "An error occurred while processing your request."
-    except Exception as e:
-        logging.error(f"An error occurred: {e}")
-        return "An error occurred while processing your request."
-
-
-def clarify(user_request):
-    global purpose
+def getAIResponse(text, context, purpose):
+    embeddings, index, chunks = load_embeddings_and_index("./embeddings/new/embeddings.json")
+    top_result = vector_search(text, index, embeddings, chunks)
+    print(top_result)
+    top_result = summarize(top_result, purpose)
+    prompt = f"You are an AI Agent. Your purpose is: {purpose}. Consider the following user request: {text}."
     response = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
-        max_tokens=4096 - len(user_request),
+        max_tokens=2000,
         messages=[
-            {"role": "system",
-             "content": "You are a master task and purpose engineer. Please provide a main purpose for user's request to be used in by a task engineer to decide the tasks to accomplish the purpose of the user:"},
+            {"role": "system", "content": top_result},
+            {"role": "user", "content": context},
+        ]
+    )
+    res = response['choices'][0]['message']['content']
+    print('AI: ')
+    print(res)
+    return res
+
+def clarify(user_request):
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        max_tokens=2000,
+        messages=[
+            {"role": "system", "content": "You are a purpose clarification AI. Please clarify the user's purpose based on their request."},
             {"role": "user", "content": user_request},
         ]
     )
     purpose = response['choices'][0]['message']['content']
-    print('I am clarifying your purpose:')
+    print('Clarified purpose:')
     print(purpose)
     return purpose
 
+def summarize(data, purpose):
+    prompt = f"Please summarize the following information while retaining any important details related to our purpose: {purpose}.\n\n{data}"
+    response = openai.Completion.create(
+        engine="text-davinci-003",
+        prompt=prompt,
+        temperature=0,
+        max_tokens=2000,
+        top_p=1.0,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+        stop=["###"]
+    )
+    logging.info('AI Agent Summarizing:')
+    logging.info(response.choices[0].text.strip())
+    return response.choices[0].text.strip()
 
-
-def summarize(data):
-    try:
-        # Load embeddings and perform vector search
-        prompt = f"Please summarize the following {purpose}:\n{data}\n any important code or necessary information to accomplish our task in the future"
-        response = openai.Completion.create(
-            engine="text-davinci-003",
-            prompt=prompt,
-            temperature=0,
-            max_tokens=2000,
-            top_p=1.0,
-            frequency_penalty=0.0,
-            presence_penalty=0.0,
-            stop=["###"]
-        )
-        logging.info('AI Agent Summarizing:')
-        logging.info(response.choices[0].text.strip())
-        return response.choices[0].text.strip()
-    except openai.Error as e:
-        logging.error(f"OpenAI error: {e}")
-        return "An error occurred while processing your request."
-    except Exception as e:
-        logging.error(f"An error occurred: {e}")
-        return "An error occurred while processing your request."
-
-
-
-def define_task_list(clarifiedPrompt):
-    global task_list
-    role_context = 'You are a task defintions engineer for this project. You are in charge an chatgpt prompt that will create tasks to accomplish the following purpose. The tasks will be an order of functions that will use or chatgpt and access to the local filesystem to keep track of user purpose, tasks to be executed, and roles of agents executing the task. We have these roles you can assign tasks to: Provide a list of only the roles and their functions to execute'
-    task_list = getAIResponse(clarifiedPrompt, role_context)
+def define_task_list(clarifiedPrompt, purpose):
+    role_context = f'You are an AI task definition engineer. Your purpose is: {purpose}. Create tasks to accomplish this purpose. The tasks should involve using the AI and accessing the local filesystem to keep track of user purpose, tasks to be executed, and roles of agents executing the task.'
+    task_list = getAIResponse(clarifiedPrompt, role_context, purpose)
     return task_list
 
-
-def create_roles(task_list):
-    global role_list
-    role_context = 'You are a role creation engineer for this project. You will create roles for ai and file system functions to accomplish the following task list. Assign a function for each task and assign the task to a role. Provide a list of only roles and tasks to be executed'
-    role_list = getAIResponse(task_list, role_context)
+def create_roles(task_list, purpose):
+    role_context = f'You are an AI role creation engineer. Your purpose is: {purpose}. Create roles for the AI and filesystem functions to accomplish the following task list. Assign a function for each task and assign the task to a role.'
+    role_list = getAIResponse(task_list, role_context, purpose)
     return role_list
 
+def delegate_tasks(roles, purpose):
+    delegate_context = f'You are a task and function delegation engineer. Your purpose is: {purpose}. Provide an ordered list of roles and the code functions the AI role will execute to accomplish our purpose.'
+    return getAIResponse(roles, delegate_context, purpose)
 
-def delegate_tasks(roles):
-    delegate_context = 'You are an task and function delegation engineer for this project. You will clarify anything needed to accomplish or purpose and create an order of role functions to be executed to accomplish our purpose. Provide an ordered list of functions and roles to accomplish our purpose'
-    return getAIResponse(roles, delegate_context)
-
-
-def execute_tasks(tasks_to_execute):
-    execution_context = "You are a task, function, and role execution engineer for this project. You will examine the users purpose, the task list, the roles, and the order of roles. Please generate JavaScript code for a transferable, fungible token using the bsv@1.5 library. This code should include the creation, transfer, and validation of the token."
-    tasks = getAIResponse(tasks_to_execute, execution_context)
+def execute_tasks(tasks_to_execute, purpose):
+    execution_context = f"You are a task, function, and role execution engineer. Your purpose is: {purpose}. Please generate code based upon the users request."
+    tasks = getAIResponse(tasks_to_execute, execution_context, purpose)
     with open('tasks.js', 'w') as f:
         for i, task in enumerate(tasks.split('\n'), 1):
             f.write(f'// Task {i}\n{task}\n\n')
     return tasks
 
+def iterate(executed_tasks, purpose):
+    prompt = f"You are an AI iteration engineer. Your purpose is: {purpose}. Review the user's request and the results of our agent's actions. Make any modifications to better accomplish our user purpose."
+    return getAIResponse(executed_tasks, prompt, purpose)
 
-def iterate(executed_tasks):
-    iteration_context = 'You are an iteration engineer for this project. You will iterate over our task list with our user input if required  to get the code or purpose completed correctly for the user. We will use gpt as the tool for each function. Provide a list of roles'
-    print(f"Iterating over: {executed_tasks}")  # Debugging line
-    return getAIResponse(executed_tasks, iteration_context)
-
-
-def main_agent(user_request):
+def main_agent(user_request, api_key, satisfied):
     global state
+    openai.api_key = api_key
     state["purpose"] = clarify(user_request)
-    state["task_list"] = define_task_list(state["purpose"])
-    state["role_list"] = create_roles(state["task_list"])
-    tasks_to_execute = delegate_tasks(state["role_list"])
+    logging.info("Entering task list")
+    state["task_list"] = define_task_list(state["purpose"], state["purpose"])
+    logging.info("Entering role list")
+    state["role_list"] = create_roles(state["task_list"], state["purpose"])
+    logging.info("Entering delegation list")
+    tasks_to_execute = delegate_tasks(state["role_list"], state["purpose"])
     while True:
-        executed_tasks = execute_tasks(tasks_to_execute)
-        # summarize_data = summarize(executed_tasks)
-        iterations = iterate(executed_tasks)
-        print(iterations)
-        # Ask user if they are satisfied
-        user_satisfied = input("Are you satisfied with the results? (yes/no): ")
-        if user_satisfied.lower() == "yes":
+        executed_tasks = execute_tasks(tasks_to_execute, state["purpose"])
+        iterations = iterate(executed_tasks, state["purpose"])
+        logging.info(iterations)
+        # Check if user is satisfied
+        if satisfied.lower() not in ["yes", "no"]:
+            logging.error("Invalid response. Please answer with 'yes' or 'no'.")
+            continue
+        if satisfied.lower() == "yes":
             break
-    print(executed_tasks)
+    logging.info(executed_tasks)
+    return executed_tasks
 
-
-state["api_key"] = input('Enter your OpenAI API key: ')
-openai.api_key = state["api_key"]
 
 while True:
+    openai.api_key = input('add OPENAI API KEY: ')
     user_request = input('Please provide request (type "exit" to quit): ')
     if user_request.lower() == 'exit':
         break
+    if user_request.strip() == "":
+        logging.error("User request cannot be empty.")
+        continue
     main_agent(user_request)

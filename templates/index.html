@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AI Agent</title>
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            background-color: #f0f0f0;
+        }
+        h1 {
+            color: #333;
+        }
+        form {
+            margin-bottom: 20px;
+        }
+        input, select {
+            padding: 10px;
+            margin: 10px 0;
+            width: 100%;
+            box-sizing: border-box;
+        }
+        #result {
+            width: 100%;
+            height: 300px;
+            border: 1px solid #ccc;
+            padding: 10px;
+            box-sizing: border-box;
+            overflow-y: auto;
+        }
+    </style>
+</head>
+<body>
+    <h1>AI Agent</h1>
+    <form id="agent-form">
+        <label for="user_request">User Request:</label><br>
+        <input type="text" id="user_request" name="user_request"><br>
+        <label for="api_key">OpenAI API Key:</label><br>
+        <input type="password" id="api_key" name="api_key"><br>
+        <label for="satisfied">Are you satisfied with the results?</label><br>
+        <select id="satisfied" name="satisfied">
+            <option value="no">No</option>
+            <option value="yes">Yes</option>
+        </select><br>
+        <input type="submit" value="Submit">
+    </form>
+    <div id="result"></div>
+    <script>
+        $("#agent-form").submit(function(event) {
+            event.preventDefault();
+            var user_request = $("#user_request").val();
+            var api_key = $("#api_key").val();
+            var satisfied = $("#satisfied").val();
+            $.post("/api", { user_request: user_request, api_key: api_key, satisfied: satisfied }, function(data) {
+                $("#result").append("<pre>" + JSON.stringify(data, null, 2) + "</pre>");
+                $('#result').scrollTop($('#result')[0].scrollHeight);
+            });
+        });
+    </script>
+</body>
+</html>
